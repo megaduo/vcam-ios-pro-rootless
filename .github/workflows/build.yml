@@ -1,80 +1,100 @@
-name: Build VCam
+name: Build VCam for Dopamine Rootless
 
 on:
-  push:
-    branches: [ main ]
-    tags: [ 'v*' ]
   workflow_dispatch:
+  push:
+    branches: [main, test/baseline-unique-package]
+    tags: ['v*']
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    name: Build iOS Tweak
-    runs-on: macos-14
-    
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      THEOS: ${{ github.workspace }}/.theos-toolchain
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Check out source
+        uses: actions/checkout@v4
 
-    - name: Install dependencies
-      run: |
-        brew install ldid xz
-      timeout-minutes: 10
+      - name: Install build dependencies
+        run: brew install ldid dpkg xz zstd make
 
-    - name: Install Theos
-      run: |
-        export THEOS=~/theos
-        git clone --recursive https://github.com/theos/theos.git ~/theos
-        echo "THEOS=$HOME/theos" >> $GITHUB_ENV
-        echo "PATH=$HOME/theos/bin:$PATH" >> $GITHUB_ENV
-      timeout-minutes: 10
+      - name: Install standard Theos and iOS SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          mkdir -p "$THEOS/sdks"
+          curl -fL --retry 3 --retry-delay 2 \
+            https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz \
+            -o "$RUNNER_TEMP/iPhoneOS16.5.sdk.tar.xz"
+          tar -xf "$RUNNER_TEMP/iPhoneOS16.5.sdk.tar.xz" -C "$THEOS/sdks"
+          test -d "$THEOS/sdks/iPhoneOS16.5.sdk"
+          echo "$THEOS/bin" >> "$GITHUB_PATH"
+          git -C "$THEOS" rev-parse HEAD
+          xcodebuild -version
 
-    - name: Install iOS SDK
-      run: |
-        curl -fsSL https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz -o /tmp/sdk.tar.xz
-        mkdir -p $HOME/theos/sdks
-        tar -xf /tmp/sdk.tar.xz -C $HOME/theos/sdks
-        echo "Installed SDKs:"
-        ls $HOME/theos/sdks/
-      timeout-minutes: 10
+      - name: Build ordinary Dopamine rootless package
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod 755 layout/DEBIAN/postinst layout/DEBIAN/postrm
+          gmake clean THEOS_PACKAGE_SCHEME=rootless
+          gmake package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless \
+            ARCHS="arm64 arm64e" TARGET="iphone:clang:16.5:15.0"
 
-    - name: Build Tweak
-      run: |
-        export THEOS=$HOME/theos
-        export PATH=$HOME/theos/bin:$PATH
-        make clean
-        make package FINALPACKAGE=1 2>&1
-        echo "Build complete. Packages:"
-        ls -lh packages/ 2>/dev/null || echo "No packages dir"
-      timeout-minutes: 15
+      - name: Check package architecture and payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          for deb in packages/*.deb; do
+            test -f "$deb"
+            dpkg-deb -I "$deb"
+            architecture="$(dpkg-deb -f "$deb" Architecture)"
+            test "$architecture" = iphoneos-arm64
+            payload="$RUNNER_TEMP/vcam-rootless-payload"
+            mkdir -p "$payload"
+            dpkg-deb -x "$deb" "$payload"
+            test -f "$payload/var/jb/Library/MobileSubstrate/DynamicLibraries/VCam.dylib"
+            if test -d "$payload/Library" || test -d "$payload/Applications" || test -d "$payload/usr"; then
+              echo "Unexpected rootful installation paths"
+              exit 1
+            fi
+            while IFS= read -r -d '' dylib; do
+              xcrun lipo -verify_arch arm64 arm64e "$dylib"
+              xcrun otool -hv "$dylib"
+              xcrun otool -L "$dylib"
+            done < <(find "$payload" -type f -name '*.dylib' -print0)
+            python3 - "$payload/var/jb/Library/MobileSubstrate/DynamicLibraries/VCam.dylib" <<'PY'
+          import pathlib, struct, sys
+          data = pathlib.Path(sys.argv[1]).read_bytes()
+          assert data[:4] == bytes.fromhex('cafebabe'), 'Expected a universal Mach-O'
+          count = struct.unpack_from('>I', data, 4)[0]
+          found = set()
+          for index in range(count):
+              cpu, subtype, offset, size, alignment = struct.unpack_from('>IIIII', data, 8 + 20 * index)
+              magic, inner_cpu, inner_subtype = struct.unpack_from('<III', data, offset)
+              assert magic == 0xfeedfacf and inner_cpu == cpu == 0x0100000c
+              assert (inner_subtype & 0x00ffffff) == (subtype & 0x00ffffff)
+              if (inner_subtype & 0x00ffffff) == 2:
+                  assert inner_subtype == 0x80000002, f'Incompatible arm64e ABI: {inner_subtype:#x}'
+                  found.add('arm64e')
+              elif inner_subtype == 0:
+                  found.add('arm64')
+          assert found == {'arm64', 'arm64e'}, found
+          print('Verified arm64 and iOS 14+ arm64e ABI')
+          PY
+            cp "$deb" output/
+          done
 
-    - name: Extract dylib
-      run: |
-        mkdir -p output
-        DEB=$(ls packages/*.deb 2>/dev/null | head -1)
-        if [ -z "$DEB" ]; then
-          echo "No deb found!"
-          exit 1
-        fi
-        echo "Found: $DEB"
-        cp "$DEB" output/
-        cd output
-        ar x ../packages/*.deb 2>/dev/null || dpkg-deb -x "$DEB" .
-        # Try to find dylib in extracted contents
-        find . -name "*.dylib" -exec cp {} ./VCam.dylib \; 2>/dev/null
-        # If ar worked, try tar
-        tar -xf data.tar* 2>/dev/null && find . -name "*.dylib" -exec cp {} ./VCam.dylib \; 2>/dev/null
-        ls -lh
-
-    - name: Upload dylib
-      uses: actions/upload-artifact@v4
-      with:
-        name: VCam-dylib
-        path: output/VCam.dylib
-        retention-days: 30
-
-    - name: Upload deb
-      uses: actions/upload-artifact@v4
-      with:
-        name: VCam-deb
-        path: output/*.deb
-        retention-days: 30
+      - name: Upload rootless deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: VCam-Dopamine-rootless
+          path: output/*.deb
+          if-no-files-found: error
+          retention-days: 30
