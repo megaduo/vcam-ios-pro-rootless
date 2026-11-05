@@ -1,0 +1,107 @@
+name: Build VCam Rootless Linux Fallback
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cross-compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      THEOS: ${{ github.workspace }}/.theos-linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross compiler and SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential fakeroot rsync curl perl zip git libxml2 libtinfo6 libplist-dev libssl-dev zlib1g-dev xz-utils
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          curl -fL --retry 3 https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz -o "$RUNNER_TEMP/toolchain.tar.xz"
+          tar -xJf "$RUNNER_TEMP/toolchain.tar.xz" -C "$THEOS/toolchain"
+          mkdir -p "$THEOS/sdks"
+          curl -fL --retry 3 https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz -o "$RUNNER_TEMP/sdk.tar.xz"
+          tar -xJf "$RUNNER_TEMP/sdk.tar.xz" -C "$THEOS/sdks"
+          echo "$THEOS/bin" >> "$GITHUB_PATH"
+          echo "$THEOS/toolchain/linux/iphone/bin" >> "$GITHUB_PATH"
+          "$THEOS/toolchain/linux/iphone/bin/clang" --version
+
+      - name: Build rootless universal package
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod 755 layout/DEBIAN/postinst layout/DEBIAN/postrm
+          make clean THEOS_PACKAGE_SCHEME=rootless
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless ARCHS="arm64 arm64e" TARGET="iphone:clang:16.5:15.0"
+
+      - name: Prepare documented arm64e converter
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --recursive --depth 1 https://github.com/p0358/allemande.git "$RUNNER_TEMP/allemande"
+          g++ -std=c++20 -O2 -o "$RUNNER_TEMP/allemande/allemande" "$RUNNER_TEMP/allemande/main.cpp"
+
+      - name: Convert if necessary and re-sign
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb="$(find packages -maxdepth 1 -name '*.deb' -print -quit)"
+          test -n "$deb"
+          package="$RUNNER_TEMP/converted-package"
+          dpkg-deb -R "$deb" "$package"
+          dylib="$package/var/jb/Library/MobileSubstrate/DynamicLibraries/VCam.dylib"
+          test -f "$dylib"
+          python3 - "$dylib" "$RUNNER_TEMP/needs-conversion" <<'PY'
+          import pathlib, struct, sys
+          data = pathlib.Path(sys.argv[1]).read_bytes()
+          assert data[:4] == bytes.fromhex('cafebabe'), 'Not a universal Mach-O'
+          found = set()
+          needs_conversion = False
+          for index in range(struct.unpack_from('>I', data, 4)[0]):
+              _, _, offset, _, _ = struct.unpack_from('>IIIII', data, 8 + 20 * index)
+              magic, cpu, subtype = struct.unpack_from('<III', data, offset)
+              assert magic == 0xfeedfacf and cpu == 0x0100000c
+              if subtype == 0:
+                  found.add('arm64')
+              elif subtype == 2:
+                  found.add('arm64e')
+                  needs_conversion = True
+              elif subtype == 0x80000002:
+                  found.add('arm64e')
+              else:
+                  raise RuntimeError(f'Unexpected CPU subtype: {subtype:#x}')
+          assert found == {'arm64', 'arm64e'}
+          if needs_conversion:
+              pathlib.Path(sys.argv[2]).touch()
+          PY
+          if test -f "$RUNNER_TEMP/needs-conversion"; then
+            "$RUNNER_TEMP/allemande/allemande" "$dylib"
+          fi
+          ldid -s "$dylib"
+          ldid -S "$dylib"
+          python3 - "$package/DEBIAN/control" <<'PY'
+          import pathlib, re, sys
+          p = pathlib.Path(sys.argv[1])
+          text = p.read_text()
+          text = re.sub(r'^Name:.*$', 'Name: VCam Rootless Experimental', text, flags=re.M)
+          text = re.sub(r'^Version:.*$', 'Version: 1.0.1-1+linux1', text, flags=re.M)
+          p.write_text(text)
+          PY
+          mkdir -p output
+          dpkg-deb --root-owner-group -b "$package" output/com.megaduo.vcam.rootless_1.0.1-1+linux1_iphoneos-arm64.deb
+          dpkg-deb -I output/*.deb
+          sha256sum output/*.deb
+          printf '%s\n' 'Linux cross-build with arm64e ABI conversion when required. Experimental: device testing is required.' > output/BUILD-NOTE.txt
+
+      - name: Upload experimental rootless package
+        uses: actions/upload-artifact@v4
+        with:
+          name: VCam-rootless-experimental-converted
+          path: output/*
+          if-no-files-found: error
+          retention-days: 30
