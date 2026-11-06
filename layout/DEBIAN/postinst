@@ -2,4 +2,9 @@
 set -e
 chmod 755 /var/jb/Library/MobileSubstrate/DynamicLibraries/VCam.dylib
 chmod 644 /var/jb/Library/MobileSubstrate/DynamicLibraries/VCam.plist
+if [ ! -d /var/mobile/Media/Downloads ]; then
+  mkdir -p /var/mobile/Media/Downloads
+  chown 501:501 /var/mobile/Media/Downloads
+  chmod 755 /var/mobile/Media/Downloads
+fi
 exit 0
