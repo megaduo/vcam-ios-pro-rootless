@@ -372,25 +372,6 @@ static void vcam_shm_write(const uint8_t *nv12, size_t len, uint32_t w, uint32_t
     hdr->seq = seq;
 }
 
-static CMSampleBufferRef vcam_shm_read_latest(void) {
-    static int fd = -1;
-    static uint8_t *map = NULL;
-    static uint32_t lastSeq = 0;
-    if (fd < 0) {
-        fd = open(kShmPath, O_RDONLY);
-        if (fd < 0) return NULL;
-        map = (uint8_t *)mmap(NULL, VSHM_SIZE, PROT_READ, MAP_SHARED, fd, 0);
-        if (map == MAP_FAILED) return NULL;
-    }
-    VShmHeader *hdr = (VShmHeader *)map;
-    if (hdr->magic != VSHM_MAGIC) return NULL;
-    if (hdr->seq == lastSeq) return NULL;
-    lastSeq = hdr->seq;
-    if (hdr->w == 0 || hdr->h == 0 || hdr->len == 0 || hdr->len > VSHM_SLOT) return NULL;
-    return vcam_sample_from_nv12(map + sizeof(VShmHeader) + (hdr->seq % 2) * VSHM_SLOT,
-                                 hdr->w, hdr->h);
-}
-
 // ============================================================================
 // MARK: - Stream TCP (solo SpringBoard — la Camara tiene sandbox sin sockets)
 // ============================================================================

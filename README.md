@@ -11,3 +11,5 @@ The floating window passes modal picker touches correctly, is shown while the cl
 WeChat and Today Watermark Camera are test targets, not verified supported applications. Apps using private capture/rendering pipelines may bypass these hooks; device testing is required. This does not change timestamps, location, watermark logic, or microphone audio. Keep only one VCam variant installed.
 
 Based on castielmartinezoj-ui/VCam commit cfc6e8b78bacf6b5c0037a70df07571aa5dd6462; original README and attribution are included. The bank-specific hiding module is excluded. The source has no settings bundle. Build the included workflow on macOS with Apple's toolchain.
+
+Third-party client frame replacement in this build uses imported photos/videos. The legacy desktop TCP sender is not connected to the new third-party renderer.
