@@ -1,6 +1,6 @@
 Package: com.megaduo.vcam.castielenglish
 Name: VCam English
-Version: 1.0.0-3+controls1
+Version: 1.0.0-5+settings2
 Architecture: iphoneos-arm64
 Description: English camera controls with per-app media import, standard preview overlays and video-output delegate replacement
 Maintainer: megaduo
