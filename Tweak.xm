@@ -4,6 +4,8 @@
 #import <objc/message.h>
 #import <substrate.h>
 #import "MediaManager.h"
+#import "VCamFrames.h"
+#import <objc/runtime.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
@@ -56,6 +58,57 @@ typedef struct __attribute__((packed)) {
     uint32_t pad[3];
 } VShmHeader;
 #define VSHM_SIZE (sizeof(VShmHeader) + VSHM_SLOT * 2)
+static BOOL g_localClient = NO;
+static NSString *g_mediaDirectory = @"/var/mobile/Media/Downloads";
+static NSHashTable *g_captureSessions = nil;
+static void vcam_preview_update(void);
+static void setupFloatButton(void);
+static void vcamConfigureFrames(void) {
+    NSString *file = g_cfgMode == 2 ? [NSString stringWithUTF8String:g_cfgImage] : kSharedVideo;
+    [VCamFrames.shared configureMode:g_cfgMode path:file zoom:g_cfgZoom x:g_cfgOffX y:g_cfgOffY];
+}
+static void vcamPrepareClientPaths(NSString *bundleID) {
+    // Keep the existing desktop/system-Camera workflow. Sandboxed third-party
+    // apps import their own media into Application Support using PHPicker.
+    if ([bundleID isEqualToString:@"com.apple.springboard"] ||
+        [bundleID isEqualToString:@"com.apple.camera"]) return;
+    NSURL *support = [NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory
+                                                        inDomains:NSUserDomainMask].firstObject;
+    if (!support) return;
+    NSURL *dir = [support URLByAppendingPathComponent:@"VCam" isDirectory:YES];
+    NSError *error = nil;
+    if (![NSFileManager.defaultManager createDirectoryAtURL:dir withIntermediateDirectories:YES
+                                               attributes:nil error:&error]) {
+        NSLog(@"[VCam] client directory unavailable: %@", error);
+        return;
+    }
+    g_localClient = YES;
+    g_mediaDirectory = dir.path;
+    kCfgPath = [dir.path stringByAppendingPathComponent:@"vcam_image.cfg"];
+    kFlagFile = [dir.path stringByAppendingPathComponent:@".vcam_on"];
+    kSharedVideo = [dir.path stringByAppendingPathComponent:@"video.mp4"];
+}
+static BOOL vcamImportFile(NSURL *source, NSString *destination) {
+    if ([source.path isEqualToString:destination]) return YES;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *temp = [[destination stringByDeletingLastPathComponent]
+                     stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+    NSError *error = nil;
+    if (![fm copyItemAtPath:source.path toPath:temp error:&error]) {
+        NSLog(@"[VCam] media import failed: %@", error); return NO;
+    }
+    BOOL ok;
+    if ([fm fileExistsAtPath:destination]) {
+        ok = [fm replaceItemAtURL:[NSURL fileURLWithPath:destination]
+                   withItemAtURL:[NSURL fileURLWithPath:temp] backupItemName:nil
+                         options:0 resultingItemURL:nil error:&error];
+    } else {
+        ok = [fm moveItemAtPath:temp toPath:destination error:&error];
+    }
+    if (!ok) { [fm removeItemAtPath:temp error:nil]; NSLog(@"[VCam] media install failed: %@", error); }
+    return ok;
+}
+
 static const char *kShmPath = "/var/mobile/Media/Downloads/vcam_stream.shm";
 
 // ============================================================================
@@ -68,7 +121,7 @@ static void vcam_log(const char *fmt, ...) {
     char buf[512];
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    NSString *logPath = @"/var/mobile/Media/Downloads/.vcam_ctor_log";
+    NSString *logPath = [g_mediaDirectory stringByAppendingPathComponent:@"VCam.log"];
     NSString *entry = [NSString stringWithFormat:@"%s\n", buf];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
     if (!fh) {
@@ -89,6 +142,7 @@ static void vcam_cfg_write(void) {
     NSString *s = [NSString stringWithFormat:@"%d\n%s\n%.3f\n%.3f\n%.3f",
                    g_cfgMode, g_cfgImage, g_cfgZoom, g_cfgOffX, g_cfgOffY];
     [s writeToFile:kCfgPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    vcamConfigureFrames();
 }
 
 static void vcam_cfg_read(void) {
@@ -104,7 +158,10 @@ static void vcam_cfg_read(void) {
     if (lines.count >= 3) g_cfgZoom = [lines[2] floatValue];
     if (lines.count >= 4) g_cfgOffX = [lines[3] floatValue];
     if (lines.count >= 5) g_cfgOffY = [lines[4] floatValue];
-    if (g_cfgZoom < 0.2) g_cfgZoom = 1.0;
+    if (g_cfgZoom < 0.2 || !isfinite(g_cfgZoom)) g_cfgZoom = 1.0;
+    if (g_cfgMode < 0 || g_cfgMode > 2) g_cfgMode = 0;
+    g_vcamEnabled = g_cfgMode != 0;
+    vcamConfigureFrames();
 }
 
 // ============================================================================
@@ -442,6 +499,7 @@ static void vcam_start_stream_listener(void) {
 @implementation VCamPassthroughWindow
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
+    if (self.rootViewController.presentedViewController) return hit;
     if (hit == self.passthroughTarget ||
         (hit && [hit isDescendantOfView:self.passthroughTarget])) {
         return hit;
@@ -491,7 +549,7 @@ static void setSharedFlag(BOOL on);
 }
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     NSString *name = self.files[(NSUInteger)ip.row];
-    NSString *full = [@"/var/mobile/Media/Downloads/" stringByAppendingString:name];
+    NSString *full = [g_mediaDirectory stringByAppendingPathComponent:name];
     strlcpy(g_cfgImage, [full UTF8String] ?: "", sizeof(g_cfgImage));
     g_cfgMode = 2;
     vcam_cfg_write();
@@ -516,61 +574,44 @@ static VCamTableDS *g_tableDS = nil;
 
 @implementation VCamPickerDelegate
 - (void)picker:(id)picker didFinishPicking:(NSArray *)results {
-    vcam_log("picker: finished with %lu results", (unsigned long)results.count);
     [picker dismissViewControllerAnimated:YES completion:nil];
     if (results.count == 0) return;
-    id r = results[0];
-    id prov = [r valueForKey:@"itemProvider"];
-    if (prov && [prov respondsToSelector:@selector(hasItemConformingToTypeIdentifier:)]) {
-        BOOL has = ((BOOL (*)(id, SEL, id))objc_msgSend)(prov,
-            @selector(hasItemConformingToTypeIdentifier:), @"public.image");
-        if (has) {
-            void (^handler)(NSURL *, NSError *) = ^(NSURL *url, NSError *err) {
-                @autoreleasepool {
-                    if (!url || err) {
-                        vcam_log("picker: image loading failed: %s",
-                                 [err.localizedDescription UTF8String]);
-                        return;
-                    }
-                    NSString *dest = @"/var/mobile/Media/Downloads/vcam_picked.jpg";
-                    NSError *copyErr = nil;
-                    [[NSFileManager defaultManager] removeItemAtPath:dest error:nil];
-                    BOOL ok = [[NSFileManager defaultManager] copyItemAtPath:url.path toPath:dest error:&copyErr];
-                    vcam_log("picker: copy to Downloads %s (%s)",
-                             ok ? "OK" : "FAILED",
-                             copyErr ? [copyErr.localizedDescription UTF8String] : "-");
-                    if (!ok) return;
-                    strlcpy(g_cfgImage, [dest UTF8String] ?: "", sizeof(g_cfgImage));
+    id provider = [results[0] valueForKey:@"itemProvider"];
+    if (![provider respondsToSelector:@selector(hasItemConformingToTypeIdentifier:)]) return;
+    BOOL movie = ((BOOL (*)(id, SEL, id))objc_msgSend)(provider,
+        @selector(hasItemConformingToTypeIdentifier:), @"public.movie");
+    NSString *type = movie ? @"public.movie" : @"public.image";
+    NSString *destination = movie ? kSharedVideo :
+        [g_mediaDirectory stringByAppendingPathComponent:@"vcam_picked.jpg"];
+    void (^handler)(NSURL *, NSError *) = ^(NSURL *url, NSError *error) {
+        @autoreleasepool {
+            if (!url || error || !vcamImportFile(url, destination)) {
+                NSLog(@"[VCam] picker import failed: %@", error); return;
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (movie) {
+                    g_cfgImage[0] = '\0';
+                    g_cfgMode = 1;
+                    [MediaManager.sharedManager loadMediaFromURL:[NSURL fileURLWithPath:destination]];
+                    [MediaManager.sharedManager start];
+                } else {
+                    strlcpy(g_cfgImage, destination.UTF8String, sizeof(g_cfgImage));
                     g_cfgMode = 2;
-                    vcam_cfg_write();
-                    setSharedFlag(YES);
-                    g_vcamEnabled = YES;
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        @autoreleasepool {
-                            if (g_tableDS) {
-                                NSFileManager *fm = [NSFileManager defaultManager];
-                                NSArray *files = [fm contentsOfDirectoryAtPath:@"/var/mobile/Media/Downloads" error:nil];
-                                NSMutableArray *images = [NSMutableArray array];
-                                for (NSString *f in files) {
-                                    NSString *ext = [[f pathExtension] lowercaseString];
-                                    if ([ext isEqualToString:@"jpg"] || [ext isEqualToString:@"jpeg"] ||
-                                        [ext isEqualToString:@"png"] || [ext isEqualToString:@"heic"]) {
-                                        [images addObject:f];
-                                    }
-                                }
-                                g_tableDS.files = images;
-                                UITableView *table = (UITableView *)[g_panel viewWithTag:9001];
-                                if (table) [table reloadData];
-                            }
-                        }
-                    });
                 }
-            };
-            ((void (*)(id, SEL, id, id))objc_msgSend)(prov,
-                @selector(loadFileRepresentationForTypeIdentifier:completionHandler:),
-                @"public.image", handler);
+                g_vcamEnabled = YES;
+                setSharedFlag(YES);
+                vcam_cfg_write();
+                g_floatButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9];
+                UISwitch *sw = (UISwitch *)[g_panel viewWithTag:9005];
+                sw.on = movie;
+                vcam_preview_update();
+                vcam_log("picker: imported %s for %s", movie ? "video" : "image",
+                         NSBundle.mainBundle.bundleIdentifier.UTF8String);
+            });
         }
-    }
+    };
+    ((void (*)(id, SEL, id, id))objc_msgSend)(provider,
+        @selector(loadFileRepresentationForTypeIdentifier:completionHandler:), type, handler);
 }
 @end
 
@@ -589,8 +630,11 @@ static void vcam_open_gallery(void) {
     }
     id cfg = [[cfgCls alloc] init];
     if (filterCls) {
-        id imgFilter = ((id (*)(id, SEL))objc_msgSend)(filterCls, sel_registerName("imagesFilter"));
-        [cfg setValue:imgFilter forKey:@"filter"];
+        id imageFilter = ((id (*)(id, SEL))objc_msgSend)(filterCls, sel_registerName("imagesFilter"));
+        id videoFilter = ((id (*)(id, SEL))objc_msgSend)(filterCls, sel_registerName("videosFilter"));
+        id mediaFilter = ((id (*)(id, SEL, id))objc_msgSend)(filterCls,
+            sel_registerName("anyFilterMatchingSubfilters:"), @[imageFilter, videoFilter]);
+        [cfg setValue:mediaFilter forKey:@"filter"];
     }
     [cfg setValue:@1 forKey:@"selectionLimit"];
 
@@ -613,7 +657,7 @@ static void setupImagePanel(void) {
     if (g_panel) {
         // refrescar lista de archivos
         NSFileManager *fm = [NSFileManager defaultManager];
-        NSArray *files = [fm contentsOfDirectoryAtPath:@"/var/mobile/Media/Downloads" error:nil];
+        NSArray *files = [fm contentsOfDirectoryAtPath:g_mediaDirectory error:nil];
         NSMutableArray *images = [NSMutableArray array];
         for (NSString *f in files) {
             NSString *ext = [[f pathExtension] lowercaseString];
@@ -680,7 +724,7 @@ static void setupImagePanel(void) {
     // Boton galeria (carrete del telefono)
     UIButton *gallery = [UIButton buttonWithType:UIButtonTypeSystem];
     gallery.frame = CGRectMake(16, 44, pw - 32, 36);
-    [gallery setTitle:@"Choose Photo from Library" forState:UIControlStateNormal];
+    [gallery setTitle:@"Choose Photo or Video" forState:UIControlStateNormal];
     gallery.backgroundColor = [UIColor colorWithRed:0.55 green:0.35 blue:0.9 alpha:1.0];
     [gallery setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     gallery.layer.cornerRadius = 8;
@@ -698,7 +742,7 @@ static void setupImagePanel(void) {
     [g_panel addSubview:table];
 
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *files = [fm contentsOfDirectoryAtPath:@"/var/mobile/Media/Downloads" error:nil];
+    NSArray *files = [fm contentsOfDirectoryAtPath:g_mediaDirectory error:nil];
     NSMutableArray *images = [NSMutableArray array];
     for (NSString *f in files) {
         NSString *ext = [[f pathExtension] lowercaseString];
@@ -738,7 +782,7 @@ static void setupImagePanel(void) {
 
     UIButton *apply = [UIButton buttonWithType:UIButtonTypeSystem];
     apply.frame = CGRectMake(16, 306, pw - 32, 42);
-    [apply setTitle:@"Apply Image to Camera" forState:UIControlStateNormal];
+    [apply setTitle:@"Apply to Camera" forState:UIControlStateNormal];
     apply.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:1.0 alpha:1.0];
     [apply setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     apply.layer.cornerRadius = 8;
@@ -858,7 +902,7 @@ static void setSharedFlag(BOOL on) {
 // el feed real queda tapado, los controles de la app siguen visibles.
 // ============================================================================
 
-static NSMutableArray *g_previewLayers = nil;   // AVCaptureVideoPreviewLayer registradas
+static NSHashTable *g_previewLayers = nil;   // AVCaptureVideoPreviewLayer registradas
 static NSTimer *g_camTimer = nil;
 
 @interface AVCaptureVideoPreviewLayer (VCamPreview)
@@ -867,7 +911,7 @@ static NSTimer *g_camTimer = nil;
 
 @implementation AVCaptureVideoPreviewLayer (VCamPreview)
 - (void)vcam_preview_attach {
-    if (!g_previewLayers) g_previewLayers = [NSMutableArray array];
+    if (!g_previewLayers) g_previewLayers = [NSHashTable weakObjectsHashTable];
     if ([g_previewLayers containsObject:self]) return;
     [g_previewLayers addObject:self];
 
@@ -898,6 +942,7 @@ static NSTimer *g_camTimer = nil;
 
 static AVQueuePlayer *g_loopPlayer = nil;
 static AVPlayerLooper *g_looper = nil;
+static NSDate *g_loopModified = nil;
 
 // ============================================================================
 // MARK: - Gestos con los dedos (arrastrar = posicion, pellizco = zoom)
@@ -942,13 +987,25 @@ static void vcam_preview_update(void);
 @end
 
 static VCamGestureHandler *g_gestureHandler = nil;
-static NSMutableSet *g_gestureViews = nil;
+static NSHashTable *g_gestureViews = nil;
 
 static void vcam_preview_update(void) {
     vcam_cfg_read();
     if (!g_previewLayers) return;
 
+    NSDate *modified = [[NSFileManager.defaultManager attributesOfItemAtPath:kSharedVideo error:nil]
+                        objectForKey:NSFileModificationDate];
+    if (g_loopPlayer && modified && ![g_loopModified isEqual:modified]) {
+        [g_loopPlayer pause]; [g_looper disableLooping];
+        g_looper = nil; g_loopPlayer = nil;
+        for (AVCaptureVideoPreviewLayer *layer in g_previewLayers.allObjects)
+            for (CALayer *sub in layer.sublayers)
+                if ([sub isKindOfClass:AVPlayerLayer.class] && [sub.name isEqualToString:@"vcam_vid"])
+                    ((AVPlayerLayer *)sub).player = nil;
+    }
+    if (g_cfgMode != 1) [g_loopPlayer pause];
     if (g_cfgMode == 1) {
+        g_loopModified = modified;
         // asegurar loop de video
         if (!g_loopPlayer) {
             NSURL *url = [NSURL fileURLWithPath:kSharedVideo];
@@ -957,16 +1014,18 @@ static void vcam_preview_update(void) {
             g_loopPlayer = [AVQueuePlayer queuePlayerWithItems:@[item]];
             g_looper = [AVPlayerLooper playerLooperWithPlayer:g_loopPlayer templateItem:item];
             [g_loopPlayer play];
+            g_loopPlayer.muted = YES;
             vcam_log("preview layer: video loop started");
         }
     }
 
-    for (AVCaptureVideoPreviewLayer *pl in g_previewLayers) {
+    if (g_cfgMode == 1) [g_loopPlayer play];
+    for (AVCaptureVideoPreviewLayer *pl in g_previewLayers.allObjects) {
         // pegar gestos al view que aloja el preview (una sola vez)
         id delegate = pl.delegate;
         if (delegate && [delegate isKindOfClass:[UIView class]]) {
             UIView *host = (UIView *)delegate;
-            if (!g_gestureViews) g_gestureViews = [NSMutableSet set];
+            if (!g_gestureViews) g_gestureViews = [NSHashTable weakObjectsHashTable];
             if (![g_gestureViews containsObject:host]) {
                 if (!g_gestureHandler) g_gestureHandler = [[VCamGestureHandler alloc] init];
                 UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
@@ -987,7 +1046,7 @@ static void vcam_preview_update(void) {
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
         for (CALayer *sub in pl.sublayers) {
-            if ([sub isKindOfClass:[AVPlayerLayer class]]) {
+            if ([sub isKindOfClass:[AVPlayerLayer class]] && [sub.name isEqualToString:@"vcam_vid"]) {
                 AVPlayerLayer *vid = (AVPlayerLayer *)sub;
                 vid.frame = pl.bounds;
                 vid.hidden = (g_cfgMode != 1);
@@ -1027,19 +1086,85 @@ static void vcam_preview_update(void) {
 // MARK: - Hooks
 // ============================================================================
 
+static void vcamRegisterPreview(AVCaptureVideoPreviewLayer *layer) {
+    if (!layer) return;
+    __weak AVCaptureVideoPreviewLayer *weakLayer = layer;
+    dispatch_async(dispatch_get_main_queue(), ^{ [weakLayer vcam_preview_attach]; });
+}
+static void vcamClientTick(void) {
+    if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) {
+        if (g_localClient) g_overlayWindow.hidden = YES;
+        return;
+    }
+    vcam_preview_update();
+    BOOL running = NO;
+    for (AVCaptureSession *session in g_captureSessions.allObjects)
+        if (session.isRunning) { running = YES; break; }
+    if (running) { setupFloatButton(); g_overlayWindow.hidden = NO; }
+    else if (!g_overlayWindow.rootViewController.presentedViewController && (!g_panel || g_panel.hidden))
+        g_overlayWindow.hidden = YES;
+}
+
+@interface VCamPhotoPixels : NSObject
+@property (nonatomic, assign) CVPixelBufferRef pixels;
+@end
+@implementation VCamPhotoPixels
+- (void)dealloc { if (_pixels) CVPixelBufferRelease(_pixels); }
+@end
+static char kVCamPhotoImageKey, kVCamPhotoPixelsKey;
+
+@interface VCamVideoDelegate : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
+@property (nonatomic, weak) id<AVCaptureVideoDataOutputSampleBufferDelegate> target;
+@end
+@implementation VCamVideoDelegate
+- (BOOL)respondsToSelector:(SEL)selector {
+    return [super respondsToSelector:selector] || [self.target respondsToSelector:selector];
+}
+- (id)forwardingTargetForSelector:(SEL)selector {
+    id target = self.target;
+    return [target respondsToSelector:selector] ? target : [super forwardingTargetForSelector:selector];
+}
+- (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sample
+       fromConnection:(AVCaptureConnection *)connection {
+    id<AVCaptureVideoDataOutputSampleBufferDelegate> target = self.target;
+    if (![target respondsToSelector:_cmd]) return;
+    CMSampleBufferRef replacement = [VCamFrames.shared copyReplacementForSample:sample];
+    [target captureOutput:output didOutputSampleBuffer:(replacement ?: sample) fromConnection:connection];
+    if (replacement) CFRelease(replacement);
+}
+@end
+static char kVCamProxyKey;
+
 %group VCamHooks
 
 // Inyecta imagen/video como sublayer del preview real de la camara
 %hook AVCaptureVideoPreviewLayer
 - (id)initWithSession:(AVCaptureSession *)session {
-    id r = %orig;
-    [self vcam_preview_attach];
-    return r;
+    id result = %orig;
+    vcamRegisterPreview(result);
+    return result;
 }
 - (id)initWithLayer:(id)layer {
-    id r = %orig;
-    [self vcam_preview_attach];
-    return r;
+    id result = %orig;
+    vcamRegisterPreview(result);
+    return result;
+}
+- (id)initWithSessionWithNoConnection:(AVCaptureSession *)session {
+    id result = %orig;
+    vcamRegisterPreview(result);
+    return result;
+}
+- (void)setSession:(AVCaptureSession *)session {
+    %orig;
+    vcamRegisterPreview(self);
+}
+- (void)setSessionWithNoConnection:(AVCaptureSession *)session {
+    %orig;
+    vcamRegisterPreview(self);
+}
+- (void)layoutSublayers {
+    %orig;
+    vcamRegisterPreview(self);
 }
 %end
 
@@ -1053,13 +1178,26 @@ static void vcam_preview_update(void) {
 - (CGImageRef)CGImageRepresentation {
     if (g_cfgMode == 2) {
         UIImage *img = vcam_image_load();
-        if (img) return CGImageRetain(img.CGImage);
+        if (img) {
+            objc_setAssociatedObject(self, &kVCamPhotoImageKey, img, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            return img.CGImage;
+        }
     }
     return %orig;
 }
 - (CVPixelBufferRef)pixelBuffer {
-    CVPixelBufferRef pb = vcam_photo_pb();
-    if (pb) return pb;
+    if (g_cfgMode == 2) {
+        VCamPhotoPixels *holder = objc_getAssociatedObject(self, &kVCamPhotoPixelsKey);
+        if (!holder) {
+            CVPixelBufferRef pb = vcam_photo_pb();
+            if (pb) {
+                holder = [VCamPhotoPixels new];
+                holder.pixels = pb;
+                objc_setAssociatedObject(self, &kVCamPhotoPixelsKey, holder, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+        }
+        if (holder.pixels) return holder.pixels;
+    }
     return %orig;
 }
 %end
@@ -1091,58 +1229,35 @@ static void vcam_preview_update(void) {
 }
 %end
 
-%hook NSObject
-- (void)captureOutput:(AVCaptureOutput *)output
-    didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
-           fromConnection:(AVCaptureConnection *)connection {
+%hook AVCaptureSession
+- (void)startRunning {
+    %orig;
+    AVCaptureSession *session = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!g_captureSessions) g_captureSessions = [NSHashTable weakObjectsHashTable];
+        [g_captureSessions addObject:session];
+        vcamClientTick();
+    });
+}
+- (void)stopRunning {
+    %orig;
+    dispatch_async(dispatch_get_main_queue(), ^{ vcamClientTick(); });
+}
+%end
 
-    static int logCount = 0;
-    if (logCount < 5) {
-        vcam_log("hook: captureOutput called in %s (frame %d)",
-                 [[[NSBundle mainBundle] bundleIdentifier] UTF8String], logCount);
-        logCount++;
-    }
-
-    vcam_cfg_read();
-
-    // 1) Modo imagen: la foto elegida con ajuste
-    if (g_cfgMode == 2) {
-        static int imgLog = 0;
-        if (imgLog < 3) {
-            vcam_log("hook: image mode active, image=%s zoom=%.2f", g_cfgImage, g_cfgZoom);
-            imgLog++;
-        }
-        CVPixelBufferRef inPB = CMSampleBufferGetImageBuffer(sampleBuffer);
-        size_t W = inPB ? CVPixelBufferGetWidth(inPB) : 540;
-        size_t H = inPB ? CVPixelBufferGetHeight(inPB) : 405;
-        if (W == 0) W = 540;
-        if (H == 0) H = 405;
-        CMSampleBufferRef imgFrame = vcam_image_sample((uint32_t)W, (uint32_t)H);
-        if (imgFrame) {
-            %orig(output, imgFrame, connection);
-            CFRelease(imgFrame);
-            return;
-        }
-    }
-
-    // 2) Stream en vivo (shm del daemon)
-    CMSampleBufferRef shmFrame = vcam_shm_read_latest();
-    if (shmFrame) {
-        %orig(output, shmFrame, connection);
-        CFRelease(shmFrame);
+%hook AVCaptureVideoDataOutput
+- (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate queue:(dispatch_queue_t)queue {
+    if (!delegate) {
+        %orig(nil, queue);
+        objc_setAssociatedObject(self, &kVCamProxyKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         return;
     }
-
-    // 3) Modo video (boton flotante)
-    if (g_vcamEnabled && [[MediaManager sharedManager] isRunning]) {
-        CMSampleBufferRef fakeFrame = [[MediaManager sharedManager] nextVideoFrame];
-        if (fakeFrame) {
-            %orig(output, fakeFrame, connection);
-            CFRelease(fakeFrame);
-            return;
-        }
-    }
-    %orig;
+    if ([(id)delegate isKindOfClass:VCamVideoDelegate.class]) { %orig(delegate, queue); return; }
+    VCamVideoDelegate *proxy = [VCamVideoDelegate new];
+    proxy.target = delegate;
+    objc_setAssociatedObject(self, &kVCamProxyKey, proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    %orig(proxy, queue);
+    vcam_log("capture delegate installed for %s", NSBundle.mainBundle.bundleIdentifier.UTF8String);
 }
 %end
 
@@ -1154,10 +1269,9 @@ static void vcam_preview_update(void) {
 
 %ctor {
     @autoreleasepool {
-        vcam_log("ctor pid=%d bundle=%s", getpid(),
-                 [[[NSBundle mainBundle] bundleIdentifier] UTF8String]);
-
         NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+        vcamPrepareClientPaths(bundleID);
+        vcam_log("ctor pid=%d bundle=%s", getpid(), bundleID.UTF8String);
         vcam_cfg_read();
 
         if ([bundleID isEqualToString:@"com.apple.springboard"]) {
@@ -1185,18 +1299,18 @@ static void vcam_preview_update(void) {
             }
             %init(VCamHooks);
 
-            if ([bundleID isEqualToString:@"com.apple.camera"]) {
-                // Apple Camera usa pipeline privado: imagen/video van como
-                // sublayer del AVCaptureVideoPreviewLayer (controles intactos)
-                g_camTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
-                                                              repeats:YES
-                                                                block:^(NSTimer *t) {
-                    @autoreleasepool {
-                        vcam_preview_update();
-                    }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                g_camTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
+                    @autoreleasepool { vcamClientTick(); }
                 }];
-                vcam_log("camera preview: 0.5s timer started in com.apple.camera");
-            }
+                [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                    object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) { vcamClientTick(); }];
+                [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification
+                    object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+                        g_overlayWindow.hidden = YES; [g_loopPlayer pause];
+                    }];
+                vcam_log("camera client ready: %s local-media=%d", bundleID.UTF8String, g_localClient);
+            });
         }
     }
 }

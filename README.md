@@ -1,15 +1,13 @@
-# VCam English for ordinary Dopamine rootless
+# VCam English — camera app compatibility build
 
-Target: iPhone 14, iOS 16.0.3, ordinary Dopamine rootless. Device testing is required.
+Target: iPhone 14, iOS 16.0.3, ordinary Dopamine rootless.
 
-Based on castielmartinezoj-ui/VCam, commit cfc6e8b78bacf6b5c0037a70df07571aa5dd6462.
-Upstream repository: https://github.com/castielmartinezoj-ui/VCam
-The upstream README states MIT licensing. Original contributors retain attribution; its README is included as README-upstream.md.
+This revision extends the English Castiel fork with standard preview-layer refresh for camera clients and a retained per-output AVCaptureVideoDataOutput delegate proxy. Rendering preserves the input dimensions, supported pixel format (BGRA / NV12 full or video range), capture timestamps, and propagated attachments. A serial renderer and a bounded pixel-buffer pool protect concurrent capture callbacks; video playback follows capture time and loops.
 
-Changes: English controls and runtime logs; standard rootless paths and package architecture; ordinary ElleKit dependency; safe installation scripts; explicit QuartzCore and PhotosUI framework linkage. The unrelated bank-specific jailbreak-hiding module is excluded from this camera build. The settings subproject remains disabled.
+Third-party apps import their own photo or video through PHPicker into their own Library/Application Support/VCam directory. Open the camera inside the app, tap the floating camera button, and choose Photo or Video. Selected media and state are separate in each app. Desktop selections remain shared with the system Camera only. No new sandbox-extension service is required.
 
-Use the draggable camera button on SpringBoard to open the panel. Choose Photo from Library, adjust Zoom / Horizontal / Vertical, then Apply Image to Camera. Local video is read from /var/mobile/Media/Downloads/vcam_video.mp4. The upstream custom stream listens on localhost port 9876 and requires a compatible frame sender and forwarding arrangement.
+The floating window passes modal picker touches correctly, is shown while the client camera runs, and hides when the app enters the background. The standard preview registry uses weak references. Existing photo and recorded-file hooks remain from the Castiel fork.
 
-This build retains upstream camera hooks. Preview, photo and recorded-file behavior require device testing; it does not guarantee all-app live frame substitution or microphone replacement. Only install one VCam variant at a time.
+WeChat and Today Watermark Camera are test targets, not verified supported applications. Apps using private capture/rendering pipelines may bypass these hooks; device testing is required. This does not change timestamps, location, watermark logic, or microphone audio. Keep only one VCam variant installed.
 
-For an Apple-toolchain build, run the included GitHub Actions workflow on macos-15-intel. It checks rootless payload paths, Debian architecture and the arm64e ABI before uploading the deb.
+Based on castielmartinezoj-ui/VCam commit cfc6e8b78bacf6b5c0037a70df07571aa5dd6462; original README and attribution are included. The bank-specific hiding module is excluded. The source has no settings bundle. Build the included workflow on macOS with Apple's toolchain.

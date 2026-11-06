@@ -5,7 +5,7 @@ TARGET := iphone:clang:16.5:15.0
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = VCam
-VCam_FILES = Tweak.xm MediaManager.m
+VCam_FILES = Tweak.xm MediaManager.m VCamFrames.m
 VCam_CFLAGS = -fobjc-arc
 VCam_CXXFLAGS = -fobjc-arc -std=c++17 -fno-modules
 VCam_FRAMEWORKS = UIKit AVFoundation CoreMedia CoreVideo CoreImage QuartzCore MobileCoreServices PhotosUI
