@@ -1,4 +1,4 @@
-name: Build VCam English for Dopamine
+name: Build VCam English App Compatibility
 
 on:
   workflow_dispatch:
@@ -91,7 +91,7 @@ jobs:
       - name: Upload rootless deb
         uses: actions/upload-artifact@v4
         with:
-          name: VCam-Castiel-English-rootless
+          name: VCam-Castiel-Apps-rootless
           path: output/*.deb
           if-no-files-found: error
           retention-days: 30
