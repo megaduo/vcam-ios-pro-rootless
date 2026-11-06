@@ -1,4 +1,6 @@
 #import <UIKit/UIKit.h>
+#import <notify.h>
+#import <QuartzCore/QuartzCore.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <objc/message.h>
@@ -21,6 +23,27 @@
 // ============================================================================
 // MARK: - 全局状态
 // ============================================================================
+
+
+static int g_masterToken = -1, g_clientToken = -1;
+static BOOL vcamMasterEnabled(void) {
+    uint64_t state = 0;
+    if (g_masterToken >= 0) notify_get_state(g_masterToken, &state);
+    return state != 2;
+}
+static UIColor *vcamButtonColor(void) {
+    NSString *bundle = NSBundle.mainBundle.bundleIdentifier;
+    BOOL app = ![bundle isEqualToString:@"com.apple.springboard"] && ![bundle isEqualToString:@"com.apple.camera"];
+    return app ? [UIColor colorWithRed:1 green:0.48 blue:0.12 alpha:0.95]
+               : [UIColor colorWithRed:0.12 green:0.48 blue:1 alpha:0.95];
+}
+static void vcamPublishMaster(void) {
+    CFPreferencesAppSynchronize(CFSTR("com.megaduo.vcam.controls"));
+    CFPropertyListRef value = CFPreferencesCopyAppValue(CFSTR("Enabled"), CFSTR("com.megaduo.vcam.controls"));
+    BOOL enabled = !value || CFGetTypeID(value) != CFBooleanGetTypeID() || CFBooleanGetValue((CFBooleanRef)value);
+    if (value) CFRelease(value);
+    if (g_masterToken >= 0) notify_set_state(g_masterToken, enabled ? 1 : 2);
+}
 
 static BOOL g_vcamEnabled = NO;
 static UIWindow *g_overlayWindow = nil;
@@ -65,7 +88,7 @@ static void vcam_preview_update(void);
 static void setupFloatButton(void);
 static void vcamConfigureFrames(void) {
     NSString *file = g_cfgMode == 2 ? [NSString stringWithUTF8String:g_cfgImage] : kSharedVideo;
-    [VCamFrames.shared configureMode:g_cfgMode path:file zoom:g_cfgZoom x:g_cfgOffX y:g_cfgOffY];
+    [VCamFrames.shared configureMode:(vcamMasterEnabled() ? g_cfgMode : 0) path:file zoom:g_cfgZoom x:g_cfgOffX y:g_cfgOffY];
 }
 static void vcamPrepareClientPaths(NSString *bundleID) {
     // Keep the existing desktop/system-Camera workflow. Sandboxed third-party
@@ -161,6 +184,7 @@ static void vcam_cfg_read(void) {
     if (g_cfgZoom < 0.2 || !isfinite(g_cfgZoom)) g_cfgZoom = 1.0;
     if (g_cfgMode < 0 || g_cfgMode > 2) g_cfgMode = 0;
     g_vcamEnabled = g_cfgMode != 0;
+    if (!vcamMasterEnabled()) { g_cfgMode = 0; g_vcamEnabled = NO; }
     vcamConfigureFrames();
 }
 
@@ -537,7 +561,7 @@ static void setSharedFlag(BOOL on);
     setSharedFlag(YES);
     g_vcamEnabled = YES;
     if (g_floatButton) {
-        g_floatButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9];
+        g_floatButton.backgroundColor = vcamButtonColor();
     }
     [tv deselectRowAtIndexPath:ip animated:YES];
     vcam_log("selected image: %s", g_cfgImage);
@@ -582,7 +606,7 @@ static VCamTableDS *g_tableDS = nil;
                 g_vcamEnabled = YES;
                 setSharedFlag(YES);
                 vcam_cfg_write();
-                g_floatButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9];
+                g_floatButton.backgroundColor = vcamButtonColor();
                 UISwitch *sw = (UISwitch *)[g_panel viewWithTag:9005];
                 sw.on = movie;
                 vcam_preview_update();
@@ -690,8 +714,8 @@ static void setupImagePanel(void) {
         vcam_cfg_write();
         if (g_floatButton) {
             g_floatButton.backgroundColor = g_vcamEnabled
-                ? [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9]
-                : [UIColor colorWithRed:0.4 green:0.4 blue:0.4 alpha:0.9];
+                ? vcamButtonColor()
+                : [vcamButtonColor() colorWithAlphaComponent:0.55];
         }
     }] forControlEvents:UIControlEventValueChanged];
     [g_panel addSubview:sw];
@@ -783,7 +807,7 @@ static void setupImagePanel(void) {
         vcam_log("apply: mode=%d image=%s zoom=%.2f x=%.2f y=%.2f",
                  g_cfgMode, g_cfgImage, g_cfgZoom, g_cfgOffX, g_cfgOffY);
         if (g_floatButton) {
-            g_floatButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9];
+            g_floatButton.backgroundColor = vcamButtonColor();
         }
         g_panel.hidden = YES;
     }] forControlEvents:UIControlEventTouchUpInside];
@@ -811,7 +835,7 @@ static void setupImagePanel(void) {
 }
 
 static void setupFloatButton() {
-    if (g_floatButton) return;
+    if (!vcamMasterEnabled() || g_floatButton) return;
 
     CGFloat btnSize = 50;
     CGRect screen = [UIScreen mainScreen].bounds;
@@ -824,8 +848,8 @@ static void setupFloatButton() {
     g_floatButton.layer.shadowOpacity = 0.3;
     g_floatButton.layer.shadowRadius = 4;
     g_floatButton.backgroundColor = g_vcamEnabled
-        ? [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9]
-        : [UIColor colorWithRed:0.4 green:0.4 blue:0.4 alpha:0.9];
+        ? vcamButtonColor()
+        : [vcamButtonColor() colorWithAlphaComponent:0.55];
 
     [g_floatButton setTitle:@"📷" forState:UIControlStateNormal];
     g_floatButton.titleLabel.font = [UIFont systemFontOfSize:24];
@@ -1081,6 +1105,9 @@ static void vcamClientTick(void) {
     BOOL running = NO;
     for (AVCaptureSession *session in g_captureSessions.allObjects)
         if (session.isRunning) { running = YES; break; }
+    if (g_localClient && running && g_clientToken >= 0)
+        notify_set_state(g_clientToken, (uint64_t)(CACurrentMediaTime() * 1000));
+    if (!vcamMasterEnabled()) { g_overlayWindow.hidden = YES; g_panel.hidden = YES; return; }
     if (running) { setupFloatButton(); g_overlayWindow.hidden = NO; }
     else if (!g_overlayWindow.rootViewController.presentedViewController && (!g_panel || g_panel.hidden))
         g_overlayWindow.hidden = YES;
@@ -1250,12 +1277,27 @@ static char kVCamProxyKey;
 
 %ctor {
     @autoreleasepool {
+        notify_register_check("com.megaduo.vcam.master", &g_masterToken);
+        notify_register_check("com.megaduo.vcam.camera-client", &g_clientToken);
         NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+        if ([bundleID isEqualToString:@"com.apple.springboard"]) vcamPublishMaster();
         vcamPrepareClientPaths(bundleID);
         vcam_log("ctor pid=%d bundle=%s", getpid(), bundleID.UTF8String);
         vcam_cfg_read();
 
         if ([bundleID isEqualToString:@"com.apple.springboard"]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
+                    vcamPublishMaster();
+                    uint64_t stamp = 0;
+                    if (g_clientToken >= 0) notify_get_state(g_clientToken, &stamp);
+                    uint64_t now = (uint64_t)(CACurrentMediaTime() * 1000);
+                    BOOL appCamera = stamp > 0 && now >= stamp && now - stamp < 1500;
+                    if (vcamMasterEnabled() && !g_floatButton) setupFloatButton();
+                    g_overlayWindow.hidden = !vcamMasterEnabled() || appCamera;
+                    if (g_overlayWindow.hidden) g_panel.hidden = YES;
+                }];
+            });
             // SpringBoard: listener TCP + botones + panel
             vcam_start_stream_listener();
             NSFileManager *fm = [NSFileManager defaultManager];

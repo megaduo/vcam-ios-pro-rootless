@@ -11,3 +11,6 @@ VCam_CXXFLAGS = -fobjc-arc -std=c++17 -fno-modules
 VCam_FRAMEWORKS = UIKit AVFoundation CoreMedia CoreVideo CoreImage QuartzCore MobileCoreServices PhotosUI
 
 include $(THEOS_MAKE_PATH)/tweak.mk
+
+SUBPROJECTS += controls
+include $(THEOS_MAKE_PATH)/aggregate.mk
