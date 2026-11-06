@@ -16,6 +16,9 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Expand Settings bundle sources
+        run: python3 -c "import zipfile; zipfile.ZipFile('controls-source.zip').extractall('.')"
+
       - name: Install build dependencies
         run: brew install ldid dpkg xz zstd make
 
@@ -91,7 +94,7 @@ jobs:
       - name: Upload rootless deb
         uses: actions/upload-artifact@v4
         with:
-          name: VCam-Castiel-Apps-rootless
+          name: VCam-Castiel-Controls-rootless
           path: output/*.deb
           if-no-files-found: error
           retention-days: 30
