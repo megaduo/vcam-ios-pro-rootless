@@ -1,10 +1,10 @@
-Package: com.megaduo.vcam.rootless
-Name: VCam Rootless
-Version: 1.0.1-1
+Package: com.megaduo.vcam.castielenglish
+Name: VCam English
+Version: 1.0.0-1+en1
 Architecture: iphoneos-arm64
-Description: VCam video capture tweak for ordinary Dopamine rootless on iOS 15 and 16
+Description: English camera controls based on castielmartinezoj-ui/VCam, packaged for ordinary Dopamine rootless
 Maintainer: megaduo
-Author: VCam contributors
+Author: VCam contributors; castielmartinezoj-ui
 Section: Tweaks
 Depends: ellekit, firmware (>= 15.0)
-Conflicts: com.yourname.vcam, com.mdmvenezuela.vcam.baseline, com.vcam
+Conflicts: com.vcam, com.yourname.vcam, com.megaduo.vcam.rootless, com.mdmvenezuela.vcam.baseline
