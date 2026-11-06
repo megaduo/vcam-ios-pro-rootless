@@ -2,16 +2,13 @@ name: Build VCam for Dopamine Rootless
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main, test/baseline-unique-package]
-    tags: ['v*']
 
 permissions:
   contents: read
 
 jobs:
   build:
-    runs-on: macos-26
+    runs-on: macos-15-intel
     timeout-minutes: 40
     env:
       THEOS: ${{ github.workspace }}/.theos-toolchain
@@ -65,7 +62,7 @@ jobs:
               exit 1
             fi
             while IFS= read -r -d '' dylib; do
-              xcrun lipo -verify_arch arm64 arm64e "$dylib"
+              xcrun lipo "$dylib" -verify_arch arm64 arm64e
               xcrun otool -hv "$dylib"
               xcrun otool -L "$dylib"
             done < <(find "$payload" -type f -name '*.dylib' -print0)
